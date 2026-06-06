@@ -42,7 +42,7 @@ pub use weights::WeightInfo;
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{borrow::Cow, boxed::Box};
 use codec::{DecodeLimit, Encode, FullCodec};
 use frame::{
 	prelude::*,
@@ -51,6 +51,60 @@ use frame::{
 use scale_info::TypeInfo;
 
 pub use pallet::*;
+
+/// A no-op implementation of [`QueryPreimage`] and [`StorePreimage`] for runtimes that
+/// have no on-chain preimage storage (e.g. the relay chain post-AHM, which has no
+/// `pallet-balances` and therefore cannot host `pallet-preimage`).
+///
+/// Behaviour:
+/// - `fetch` always returns `Err(DispatchError::Unavailable)`, so
+///   [`Pallet::dispatch_whitelisted_call`] (which relies on stored preimages) is
+///   effectively disabled — any call to it returns [`Error::UnavailablePreImage`].
+/// - `request`, `unrequest`, and `note` are all no-ops, so `whitelist_call` and
+///   `remove_whitelisted_call` remain fully functional.
+/// - Only [`Pallet::dispatch_whitelisted_call_with_preimage`] is operational: the
+///   caller supplies the full call inline and it is hash-checked on the spot.
+///
+/// Recommended relay-chain wiring (RFC #12224):
+/// ```ignore
+/// impl pallet_whitelist::Config for Runtime {
+///     type Preimages              = pallet_whitelist::NoopPreimages<Self::Hashing>;
+///     type DispatchWhitelistedOrigin = frame_system::EnsureAuthorized<Self::AccountId>;
+///     type EnableAuthorizedDispatch  = ConstBool<true>;
+///     // ...
+/// }
+/// ```
+pub struct NoopPreimages<H>(core::marker::PhantomData<H>);
+
+impl<H: frame::deps::sp_runtime::traits::Hash> QueryPreimage for NoopPreimages<H> {
+	type H = H;
+
+	fn len(_hash: &H::Output) -> Option<u32> {
+		None
+	}
+
+	fn fetch(_hash: &H::Output, _len: Option<u32>) -> frame::deps::frame_support::traits::FetchResult {
+		Err(DispatchError::Unavailable)
+	}
+
+	fn is_requested(_hash: &H::Output) -> bool {
+		false
+	}
+
+	fn request(_hash: &H::Output) {}
+
+	fn unrequest(_hash: &H::Output) {}
+}
+
+impl<H: frame::deps::sp_runtime::traits::Hash> StorePreimage for NoopPreimages<H> {
+	/// No preimage can ever be stored; callers that depend on `note` must use
+	/// `dispatch_whitelisted_call_with_preimage` with an inline payload instead.
+	const MAX_LENGTH: usize = 0;
+
+	fn note(_bytes: Cow<[u8]>) -> Result<H::Output, DispatchError> {
+		Err(DispatchError::Exhausted)
+	}
+}
 
 #[frame::pallet]
 pub mod pallet {
@@ -79,6 +133,18 @@ pub mod pallet {
 
 		/// The handler of pre-images.
 		type Preimages: QueryPreimage<H = Self::Hashing> + StorePreimage;
+
+		/// When `true`, both `dispatch_whitelisted_call` and
+		/// `dispatch_whitelisted_call_with_preimage` can be submitted as unsigned, fee-free
+		/// transactions by anyone once the corresponding call hash is present in
+		/// [`WhitelistedCall`]. The `#[pallet::authorize]` callback enforces this at
+		/// transaction-pool admission, so oversized or bogus payloads are rejected before
+		/// any on-chain work is done.
+		///
+		/// Set `DispatchWhitelistedOrigin` to `frame_system::EnsureAuthorized` on runtimes
+		/// that enable this path; leave it as `ConstBool<false>` to preserve the existing
+		/// privileged-only behavior.
+		type EnableAuthorizedDispatch: Get<bool>;
 
 		/// The weight information for this pallet.
 		type WeightInfo: WeightInfo;
@@ -151,6 +217,8 @@ pub mod pallet {
 			T::WeightInfo::dispatch_whitelisted_call(*call_encoded_len)
 				.saturating_add(*call_weight_witness)
 		)]
+		#[pallet::authorize(Self::authorize_dispatch_whitelisted_call)]
+		#[pallet::weight_of_authorize(T::WeightInfo::authorize_dispatch_whitelisted_call())]
 		pub fn dispatch_whitelisted_call(
 			origin: OriginFor<T>,
 			call_hash: T::Hash,
@@ -193,6 +261,8 @@ pub mod pallet {
 			T::WeightInfo::dispatch_whitelisted_call_with_preimage(call_len)
 				.saturating_add(call_weight)
 		})]
+		#[pallet::authorize(Self::authorize_dispatch_whitelisted_call_with_preimage)]
+		#[pallet::weight_of_authorize(T::WeightInfo::authorize_dispatch_whitelisted_call_with_preimage())]
 		pub fn dispatch_whitelisted_call_with_preimage(
 			origin: OriginFor<T>,
 			call: Box<<T as Config>::RuntimeCall>,
@@ -217,6 +287,64 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
+	/// Pool-level authorization callback for [`Pallet::dispatch_whitelisted_call`].
+	///
+	/// Admits an unsigned submission if and only if:
+	/// 1. `T::EnableAuthorizedDispatch` is `true`, and
+	/// 2. the `call_hash` is already present in [`WhitelistedCall`].
+	///
+	/// Returning `Err` here drops the transaction before it touches block inclusion,
+	/// so no on-chain work is wasted on invalid or bogus submissions.
+	fn authorize_dispatch_whitelisted_call(
+		_source: TransactionSource,
+		call_hash: &T::Hash,
+		_call_encoded_len: &u32,
+		_call_weight_witness: &Weight,
+	) -> TransactionValidityWithRefund {
+		if !T::EnableAuthorizedDispatch::get() {
+			return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
+		}
+		if !WhitelistedCall::<T>::contains_key(call_hash) {
+			return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
+		}
+		Ok((
+			ValidTransaction {
+				provides: vec![call_hash.encode()],
+				..Default::default()
+			},
+			Weight::zero(),
+		))
+	}
+
+	/// Pool-level authorization callback for
+	/// [`Pallet::dispatch_whitelisted_call_with_preimage`].
+	///
+	/// Admits an unsigned submission if and only if:
+	/// 1. `T::EnableAuthorizedDispatch` is `true`, and
+	/// 2. `hash(call)` is already present in [`WhitelistedCall`].
+	///
+	/// The hash is computed from the inline call payload so that oversized or
+	/// tampered payloads are caught here, at pool admission, rather than on-chain.
+	fn authorize_dispatch_whitelisted_call_with_preimage(
+		_source: TransactionSource,
+		call: &Box<<T as Config>::RuntimeCall>,
+	) -> TransactionValidityWithRefund {
+		if !T::EnableAuthorizedDispatch::get() {
+			return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
+		}
+		let call_hash = T::Hashing::hash_of(call);
+		if !WhitelistedCall::<T>::contains_key(call_hash) {
+			return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
+		}
+		Ok((
+			ValidTransaction {
+				provides: vec![call_hash.encode()],
+				..Default::default()
+			},
+			Weight::zero(),
+		))
+	}
+
 	/// Clean whitelisting/preimage and dispatch call.
 	///
 	/// Return the call actual weight of the dispatched call if there is some.

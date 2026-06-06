@@ -1414,6 +1414,37 @@ impl_ensure_origin_with_arg_ignoring_arg! {
 	{}
 }
 
+/// Ensure that the origin represents a call that has been authorized via the
+/// `#[pallet::authorize]` framework and `frame_system::AuthorizeCall` transaction extension.
+///
+/// Use this as `DispatchWhitelistedOrigin` (or any `DispatchXxxOrigin`) on chains that want
+/// permissionless, fee-free dispatch once an off-chain authorization check passes.
+pub struct EnsureAuthorized<AccountId>(core::marker::PhantomData<AccountId>);
+impl<O: OriginTrait<AccountId = AccountId>, AccountId> EnsureOrigin<O>
+	for EnsureAuthorized<AccountId>
+{
+	type Success = ();
+	fn try_origin(o: O) -> Result<Self::Success, O> {
+		match o.as_system_ref() {
+			Some(RawOrigin::Authorized) => Ok(()),
+			_ => Err(o),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<O, ()> {
+		let mut origin = O::none();
+		origin.set_caller(O::PalletsOrigin::from(RawOrigin::Authorized));
+		Ok(origin)
+	}
+}
+
+impl_ensure_origin_with_arg_ignoring_arg! {
+	impl< { O: OriginTrait<AccountId = AccountId>, AccountId, T } >
+		EnsureOriginWithArg<O, T> for EnsureAuthorized<AccountId>
+	{}
+}
+
 /// Always fail.
 pub struct EnsureNever<Success>(core::marker::PhantomData<Success>);
 impl<O, Success> EnsureOrigin<O> for EnsureNever<Success> {

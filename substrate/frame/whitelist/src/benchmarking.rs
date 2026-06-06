@@ -22,7 +22,7 @@
 use super::*;
 #[cfg(test)]
 use crate::Pallet as Whitelist;
-use frame::benchmarking::prelude::*;
+use frame::{benchmarking::prelude::*, deps::frame_support::traits::Authorize};
 
 #[benchmarks]
 mod benchmarks {
@@ -108,6 +108,79 @@ mod benchmarks {
 
 		ensure!(!WhitelistedCall::<T>::contains_key(call_hash), "whitelist not removed");
 		ensure!(!T::Preimages::is_requested(&call_hash), "preimage still requested");
+		Ok(())
+	}
+
+	// Measures the execution time of the `authorize` callback for
+	// `dispatch_whitelisted_call`. The worst-case path requires `EnableAuthorizedDispatch`
+	// to be `true` and the call hash to be present in storage (a successful storage read).
+	// Returns `Weightless` when the feature is disabled in the current runtime configuration.
+	#[benchmark]
+	fn authorize_dispatch_whitelisted_call() -> Result<(), BenchmarkError> {
+		if !T::EnableAuthorizedDispatch::get() {
+			return Err(BenchmarkError::Weightless);
+		}
+
+		let whitelist_origin = T::WhitelistOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+
+		let call: <T as Config>::RuntimeCall =
+			frame_system::Call::remark { remark: alloc::vec![1u8] }.into();
+		let call_hash = T::Hashing::hash_of(&call);
+		let call_encoded_len = call.encoded_size() as u32;
+		let call_weight = call.get_dispatch_info().call_weight;
+
+		Pallet::<T>::whitelist_call(whitelist_origin, call_hash)
+			.expect("whitelisting call must be successful");
+
+		let outer_call = Call::<T>::dispatch_whitelisted_call {
+			call_hash,
+			call_encoded_len,
+			call_weight_witness: call_weight,
+		};
+
+		#[block]
+		{
+			outer_call
+				.authorize(TransactionSource::External)
+				.ok_or(BenchmarkError::Stop("authorize returned None"))?
+				.map_err(|_| BenchmarkError::Stop("authorize returned Err"))?;
+		}
+
+		Ok(())
+	}
+
+	// Measures the execution time of the `authorize` callback for
+	// `dispatch_whitelisted_call_with_preimage`.
+	// Returns `Weightless` when `EnableAuthorizedDispatch` is `false`.
+	#[benchmark]
+	fn authorize_dispatch_whitelisted_call_with_preimage() -> Result<(), BenchmarkError> {
+		if !T::EnableAuthorizedDispatch::get() {
+			return Err(BenchmarkError::Weightless);
+		}
+
+		let whitelist_origin = T::WhitelistOrigin::try_successful_origin()
+			.map_err(|_| BenchmarkError::Weightless)?;
+
+		let call: <T as Config>::RuntimeCall =
+			frame_system::Call::remark { remark: alloc::vec![1u8] }.into();
+		let call_hash = T::Hashing::hash_of(&call);
+
+		Pallet::<T>::whitelist_call(whitelist_origin, call_hash)
+			.expect("whitelisting call must be successful");
+
+		let outer_call = Call::<T>::dispatch_whitelisted_call_with_preimage {
+			call: Box::new(call),
+		};
+
+		#[block]
+		{
+			outer_call
+				.authorize(TransactionSource::External)
+				.ok_or(BenchmarkError::Stop("authorize returned None"))?
+				.map_err(|_| BenchmarkError::Stop("authorize returned Err"))?;
+		}
+
 		Ok(())
 	}
 

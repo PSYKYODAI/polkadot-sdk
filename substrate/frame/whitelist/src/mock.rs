@@ -59,6 +59,7 @@ impl pallet_whitelist::Config for Test {
 	type WhitelistOrigin = EnsureRoot<Self::AccountId>;
 	type DispatchWhitelistedOrigin = EnsureRoot<Self::AccountId>;
 	type Preimages = Preimage;
+	type EnableAuthorizedDispatch = ConstBool<false>;
 	type WeightInfo = ();
 }
 
@@ -67,4 +68,63 @@ pub fn new_test_ext() -> TestExternalities {
 	let mut ext = TestExternalities::new(t);
 	ext.execute_with(|| System::set_block_number(1));
 	ext
+}
+
+// ---------------------------------------------------------------------------
+// Second runtime: permissionless path enabled (EnableAuthorizedDispatch = true)
+// ---------------------------------------------------------------------------
+pub mod permissionless {
+	use super::*;
+	use crate as pallet_whitelist;
+
+	type Block = MockBlock<TestPermissionless>;
+
+	construct_runtime!(
+		pub enum TestPermissionless
+		{
+			System: frame_system,
+			Balances: pallet_balances,
+			Whitelist: pallet_whitelist,
+			Preimage: pallet_preimage,
+		}
+	);
+
+	#[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+	impl frame_system::Config for TestPermissionless {
+		type Block = Block;
+		type AccountData = pallet_balances::AccountData<u64>;
+	}
+
+	#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+	impl pallet_balances::Config for TestPermissionless {
+		type AccountStore = System;
+	}
+
+	impl pallet_preimage::Config for TestPermissionless {
+		type RuntimeEvent = RuntimeEvent;
+		type Currency = Balances;
+		type ManagerOrigin = EnsureRoot<Self::AccountId>;
+		type Consideration = ();
+		type WeightInfo = ();
+	}
+
+	impl pallet_whitelist::Config for TestPermissionless {
+		type RuntimeEvent = RuntimeEvent;
+		type RuntimeCall = RuntimeCall;
+		type WhitelistOrigin = EnsureRoot<Self::AccountId>;
+		// Accepts the `Authorized` system origin produced by `AuthorizeCall`.
+		type DispatchWhitelistedOrigin = frame_system::EnsureAuthorized<Self::AccountId>;
+		// NoopPreimages: fetch always fails, so dispatch_whitelisted_call is unusable;
+		// only dispatch_whitelisted_call_with_preimage (inline payload) is functional.
+		type Preimages = pallet_whitelist::NoopPreimages<Self::Hashing>;
+		type EnableAuthorizedDispatch = ConstBool<true>;
+		type WeightInfo = ();
+	}
+
+	pub fn new_test_ext() -> TestExternalities {
+		let t = RuntimeGenesisConfig::default().build_storage().unwrap();
+		let mut ext = TestExternalities::new(t);
+		ext.execute_with(|| System::set_block_number(1));
+		ext
+	}
 }
