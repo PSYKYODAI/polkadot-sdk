@@ -35,6 +35,9 @@
 //! [`frame_system::EnsureAuthorized`]), whitelisted calls can also be dispatched
 //! permissionlessly as unsigned transactions.
 //!
+//! Validating [`Pallet::dispatch_whitelisted_call`] decodes the whole preimage on every
+//! submission; prefer [`Pallet::dispatch_whitelisted_call_with_preimage`] for large calls.
+//!
 //! ## Deferred dispatch
 //!
 //! A dispatch by [`Config::DispatchWhitelistedOrigin`] of a not-yet-whitelisted hash is deferred
@@ -349,24 +352,35 @@ pub mod pallet {
 }
 
 impl<T: Config> Pallet<T> {
-	/// Origin and whitelist gate shared by both permissionless dispatch calls.
-	///
-	/// Passes when [`Config::DispatchWhitelistedOrigin`] accepts the `Authorized` system origin
-	/// and `call_hash` is present in [`WhitelistedCall`]. Runs before any preimage read, so an
-	/// unwhitelisted submission costs one map read.
-	fn ensure_authorized_whitelisted_dispatch(
-		call_hash: T::Hash,
-	) -> Result<(), TransactionValidityError> {
+	/// Passes when [`Config::DispatchWhitelistedOrigin`] accepts the `Authorized` system origin.
+	/// Runs before any hashing or preimage read, so runtimes that don't opt in reject for free.
+	fn ensure_authorized_origin() -> Result<(), TransactionValidityError> {
 		let authorized: T::RuntimeOrigin =
 			frame_system::RawOrigin::<T::AccountId>::Authorized.into();
 		T::DispatchWhitelistedOrigin::try_origin(authorized)
 			.map_err(|_| TransactionValidityError::Invalid(InvalidTransaction::Call))?;
 
+		Ok(())
+	}
+
+	/// Passes when `call_hash` is present in [`WhitelistedCall`].
+	fn ensure_whitelisted(call_hash: T::Hash) -> Result<(), TransactionValidityError> {
 		if !WhitelistedCall::<T>::contains_key(call_hash) {
 			return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
 		}
 
 		Ok(())
+	}
+
+	/// Origin and whitelist gate for the permissionless witness dispatch.
+	///
+	/// Runs before any preimage read, so an unwhitelisted submission costs one map read.
+	fn ensure_authorized_whitelisted_dispatch(
+		call_hash: T::Hash,
+	) -> Result<(), TransactionValidityError> {
+		Self::ensure_authorized_origin()?;
+
+		Self::ensure_whitelisted(call_hash)
 	}
 
 	/// Pool validity for an authorized dispatch of `call_hash`.
@@ -408,12 +422,10 @@ impl<T: Config> Pallet<T> {
 		.map_err(|_| TransactionValidityError::Invalid(InvalidTransaction::Call))?;
 
 		let call_weight = call.get_dispatch_info().call_weight;
-		if !call_weight.all_lte(*call_weight_witness) {
+		if call_weight != *call_weight_witness {
 			return Err(TransactionValidityError::Invalid(InvalidTransaction::Call));
 		}
 
-		// `all_lte` admits any witness above the call's weight, so the tag uses the decoded
-		// weight to keep those submissions in one slot.
 		Self::whitelisted_dispatch_validity(*call_hash, *call_encoded_len, call_weight)
 	}
 
@@ -422,8 +434,11 @@ impl<T: Config> Pallet<T> {
 		_source: TransactionSource,
 		call: &Box<<T as Config>::RuntimeCall>,
 	) -> TransactionValidityWithRefund {
+		// Probe before hashing: non-opted-in runtimes reject without the wasted hash.
+		Self::ensure_authorized_origin()?;
+
 		let call_hash = T::Hashing::hash_of(call).into();
-		Self::ensure_authorized_whitelisted_dispatch(call_hash)?;
+		Self::ensure_whitelisted(call_hash)?;
 
 		// The call travels with the transaction, so there is no witness to check.
 		Self::whitelisted_dispatch_validity(

@@ -210,10 +210,11 @@ mod benchmarks {
 		Ok(())
 	}
 
-	// Includes hashing the `n`-byte call and reading its dispatch info.
+	// Includes hashing the `n`-byte call and reading its dispatch info. A single remark is one
+	// call node at any `n`; the fit assumes a flat payload.
 	#[benchmark]
 	fn authorize_dispatch_whitelisted_call_with_preimage(
-		n: Linear<1, 10_000>,
+		n: Linear<1, { *T::BlockLength::get().max.get(DispatchClass::Normal) - 10 }>,
 	) -> Result<(), BenchmarkError> {
 		// Skip on runtimes that have not opted into permissionless dispatch.
 		let authorized: T::RuntimeOrigin =
